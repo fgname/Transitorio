@@ -45,7 +45,7 @@ aplicar_estilo_blindado()
 
 # --- 1. MOTOR DE DADOS ---
 HISTORICO_PATH = "historico_seriais.parquet"
-ENDERECOS_PATH = "enderecos_transitorios.xlsx"
+ENDERECOS_PATH = "Endereços Transitorios.xlsx"
 
 @st.cache_data(ttl=60)
 def load_data():
