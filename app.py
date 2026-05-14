@@ -49,6 +49,13 @@ def load_data():
     if os.path.exists(HISTORICO_PATH):
         df = pd.read_parquet(HISTORICO_PATH)
         df['DT Entrada'] = pd.to_datetime(df['DT Entrada'], errors='coerce')
+        
+        # AUTOCURA: Se a coluna de controle do último endereço não existir na base antiga, ele cria.
+        if 'DT Ultimo Endereco' not in df.columns:
+            df['DT Ultimo Endereco'] = df['DT Entrada']
+        else:
+            df['DT Ultimo Endereco'] = pd.to_datetime(df['DT Ultimo Endereco'], errors='coerce')
+            
         return df
     return pd.DataFrame()
 
@@ -87,10 +94,12 @@ def processar_motor(arquivo_novo, data_selecionada):
     if df_hist.empty:
         df_hist = df_atual.copy()
         df_hist['DT Entrada'] = data_operacao
+        df_hist['DT Ultimo Endereco'] = data_operacao
         df_hist['Endereço Anterior'] = "-"
         df_hist['Qtd Movimentações'] = 0
         df_hist['Status'] = 'Em Trânsito'
         df_hist['Dias Pendentes'] = 0
+        df_hist['Dias End. Atual'] = 0
     else:
         df_hist_ativo = df_hist[df_hist['Status'] == 'Em Trânsito'].copy()
         ativos_lista = df_hist_ativo['Serial'].tolist()
@@ -100,27 +109,36 @@ def processar_motor(arquivo_novo, data_selecionada):
         old_mov = df_hist_ativo.set_index('Serial')['Qtd Movimentações']
         old_dt = df_hist_ativo.set_index('Serial')['DT Entrada']
         old_ant = df_hist_ativo.set_index('Serial')['Endereço Anterior']
+        old_dt_ult = df_hist_ativo.set_index('Serial')['DT Ultimo Endereco']
         
         df_mantidos['DT Entrada'] = df_mantidos['Serial'].map(old_dt)
         df_mantidos['Endereço Antigo Memoria'] = df_mantidos['Serial'].map(old_end)
+        df_mantidos['DT Ultimo Endereco'] = df_mantidos['Serial'].map(old_dt_ult)
         
         mudou_mask = df_mantidos['Endereço'] != df_mantidos['Endereço Antigo Memoria']
+        
+        # Lógica de atualização quando o serial muda de endereço transitório
         df_mantidos['Endereço Anterior'] = df_mantidos['Serial'].map(old_ant)
         df_mantidos.loc[mudou_mask, 'Endereço Anterior'] = df_mantidos.loc[mudou_mask, 'Endereço Antigo Memoria']
+        df_mantidos.loc[mudou_mask, 'DT Ultimo Endereco'] = data_operacao # Reseta o relógio do endereço atual
         
         df_mantidos['Qtd Movimentações'] = df_mantidos['Serial'].map(old_mov).fillna(0)
         df_mantidos.loc[mudou_mask, 'Qtd Movimentações'] += 1
         
         df_mantidos['Status'] = 'Em Trânsito'
         df_mantidos['Dias Pendentes'] = (data_operacao - pd.to_datetime(df_mantidos['DT Entrada'])).dt.days
+        df_mantidos['Dias End. Atual'] = (data_operacao - pd.to_datetime(df_mantidos['DT Ultimo Endereco'])).dt.days
+        
         df_mantidos = df_mantidos.drop(columns=['Endereço Antigo Memoria'])
         
         df_novos = df_atual[~df_atual['Serial'].isin(ativos_lista)].copy()
         df_novos['DT Entrada'] = data_operacao
+        df_novos['DT Ultimo Endereco'] = data_operacao
         df_novos['Endereço Anterior'] = "-"
         df_novos['Qtd Movimentações'] = 0
         df_novos['Status'] = 'Em Trânsito'
         df_novos['Dias Pendentes'] = 0
+        df_novos['Dias End. Atual'] = 0
         
         df_saidas = df_hist_ativo[~df_hist_ativo['Serial'].isin(df_atual['Serial'].tolist())].copy()
         df_saidas['Status'] = 'Finalizado'
@@ -142,10 +160,8 @@ with st.sidebar:
     ultima_data_banco = None
     
     if not df_full.empty:
-        # Descobre qual foi o último dia que alguém processou
         df_pendente_temp = df_full[df_full['Status'] == 'Em Trânsito']
         if not df_pendente_temp.empty:
-            # Pega a data de entrada + dias pendentes para saber o "dia do relatório"
             ultima_data_banco = (df_pendente_temp['DT Entrada'] + pd.to_timedelta(df_pendente_temp['Dias Pendentes'], unit='d')).max()
         else:
             ultima_data_banco = pd.to_datetime(df_full['DT Saída'], errors='coerce').max()
@@ -155,7 +171,6 @@ with st.sidebar:
     data_batimento = st.date_input("Data do Novo Relatório:", value=datetime.today(), format="DD/MM/YYYY")
     arquivo = st.file_uploader("Anexe o Batimento (.xlsx)", type=['xlsx'])
     
-    # Bloqueio de segurança
     data_ja_processada = False
     if ultima_data_banco and pd.to_datetime(data_batimento) <= ultima_data_banco:
         st.error("⚠️ Esta data já consta no sistema ou é anterior à última atualização.")
@@ -212,8 +227,19 @@ if not df_pendente.empty:
 
     st.markdown("---")
     st.subheader("📋 Mapa de Rastreio Operacional")
-    df_detalhe = df_pendente[['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']].copy()
-    df_detalhe.rename(columns={'Endereço': 'Endereço Atual', 'Endereço Anterior': 'End. Anterior', 'Qtd Movimentações': 'Mov. Internas', 'DT Entrada': 'Data de Chegada'}, inplace=True)
-    df_detalhe['Data de Chegada'] = df_detalhe['Data de Chegada'].dt.strftime('%d/%m/%Y')
     
+    # Adicionando a nova métrica na visão de detalhe
+    df_detalhe = df_pendente[['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias Pendentes', 'Dias End. Atual', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']].copy()
+    
+    # Renomeando as colunas, otimizando o espaço conforme o seu padrão
+    df_detalhe.rename(columns={
+        'Endereço': 'Endereço Atual', 
+        'Endereço Anterior': 'End. Anterior', 
+        'Qtd Movimentações': 'Mov. Internas', 
+        'DT Entrada': 'DT Chegada'
+    }, inplace=True)
+    
+    df_detalhe['DT Chegada'] = df_detalhe['DT Chegada'].dt.strftime('%d/%m/%Y')
+    
+    # Tabela agora exibe a coluna "Dias End. Atual" logo do lado do total de dias
     st.dataframe(df_detalhe.sort_values(by=["Dias Pendentes", "Mov. Internas"], ascending=False), use_container_width=True, hide_index=True)
