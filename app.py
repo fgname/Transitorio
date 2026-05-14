@@ -54,6 +54,8 @@ def load_data():
             df['DT Ultimo Endereco'] = df['DT Entrada']
         else:
             df['DT Ultimo Endereco'] = pd.to_datetime(df['DT Ultimo Endereco'], errors='coerce')
+        if 'Dias End. Atual' not in df.columns:
+            df['Dias End. Atual'] = df.get('Dias Pendentes', 0)
         return df
     return pd.DataFrame()
 
@@ -204,31 +206,40 @@ if df_full.empty:
 
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.metric("Seriais no Transitório", len(df_pendente))
-qtd_estourados = len(df_pendente[df_pendente['Prioridade'] == 'ESTOURADO'])
-qtd_criticos = len(df_pendente[df_pendente['Prioridade'] == 'CRÍTICO'])
+
+# Se a base for velha e ainda não tiver a coluna, a gente previne o erro zerando visualmente
+qtd_estourados = len(df_pendente[df_pendente['Prioridade'] == 'ESTOURADO']) if 'Prioridade' in df_pendente.columns else 0
+qtd_criticos = len(df_pendente[df_pendente['Prioridade'] == 'CRÍTICO']) if 'Prioridade' in df_pendente.columns else 0
+
 with c2: st.metric("🚨 SLA Estourado", qtd_estourados)
 with c3: st.metric("⚠️ Risco Crítico", qtd_criticos)
-with c4: st.metric("🔄 Mov. Internas", len(df_pendente[df_pendente['Qtd Movimentações'] > 0]))
+with c4: st.metric("🔄 Mov. Internas", len(df_pendente[df_pendente['Qtd Movimentações'] > 0]) if 'Qtd Movimentações' in df_pendente.columns else 0)
 
 st.markdown("---")
 
 if not df_pendente.empty:
     st.subheader("🔥 Foco de Atuação: SLAs Estourados")
-    df_problema = df_pendente[df_pendente['Prioridade'] == 'ESTOURADO']
     
-    if not df_problema.empty:
-        grafico_problema = df_problema.groupby(['AZ', 'RESPONSAVEL']).size().reset_index(name='Qtd_Retida')
-        fig = px.bar(grafico_problema, x="AZ", y="Qtd_Retida", color="RESPONSAVEL", text_auto=True, template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
+    if 'Prioridade' in df_pendente.columns:
+        df_problema = df_pendente[df_pendente['Prioridade'] == 'ESTOURADO']
+        if not df_problema.empty:
+            grafico_problema = df_problema.groupby(['AZ', 'RESPONSAVEL']).size().reset_index(name='Qtd_Retida')
+            fig = px.bar(grafico_problema, x="AZ", y="Qtd_Retida", color="RESPONSAVEL", text_auto=True, template="plotly_white", color_discrete_sequence=px.colors.qualitative.Bold)
+            fig.update_layout(xaxis={'categoryorder':'total descending'}, legend_title_text="Dono da Área")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.success("🎉 Nenhum serial estourou o limite.")
     else:
-        st.success("🎉 Nenhum serial estourou o limite.")
+        st.info("Sincronize um novo batimento para ativar a contagem de SLA.")
 
     st.markdown("---")
     st.subheader("📋 Mapa de Rastreio Operacional")
     
-    # Ordem das colunas ajustada para comparação direta
+    # 🛡️ TRAVA DE SEGURANÇA RESTAURADA: Só carrega as colunas que realmente existem no Parquet
     colunas_visoes = ['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias End. Atual', 'Tempo de Rota(Dia)', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']
-    df_detalhe = df_pendente[colunas_visoes].copy()
+    colunas_existentes = [col for col in colunas_visoes if col in df_pendente.columns]
+    
+    df_detalhe = df_pendente[colunas_existentes].copy()
     
     renomeacoes = {
         'Endereço': 'Endereço Atual', 
@@ -238,12 +249,21 @@ if not df_pendente.empty:
         'Tempo de Rota(Dia)': '(Dias Permitidos no Endereço)',
         'Dias Pendentes': 'Dias Totais (Trânsito)'
     }
+    
     df_detalhe.rename(columns=renomeacoes, inplace=True)
+    
     if 'DT Chegada (Inicial)' in df_detalhe.columns:
         df_detalhe['DT Chegada (Inicial)'] = df_detalhe['DT Chegada (Inicial)'].dt.strftime('%d/%m/%Y')
     
-    # Ordenar por estouro para os piores casos subirem
-    st.dataframe(df_detalhe.sort_values(by=["Prioridade", "Dias End. Atual"], ascending=[True, False]), use_container_width=True, hide_index=True)
+    # Ordenação flexível (só usa a coluna se ela existir)
+    colunas_ordenacao = []
+    if 'Prioridade' in df_detalhe.columns: colunas_ordenacao.append('Prioridade')
+    if 'Dias End. Atual' in df_detalhe.columns: colunas_ordenacao.append('Dias End. Atual')
+    
+    if colunas_ordenacao:
+        df_detalhe = df_detalhe.sort_values(by=colunas_ordenacao, ascending=[True, False][:len(colunas_ordenacao)])
+    
+    st.dataframe(df_detalhe, use_container_width=True, hide_index=True)
 
     # --- EXPORTAÇÃO EXCEL ---
     buffer = io.BytesIO()
@@ -263,6 +283,11 @@ if not df_pendente.empty:
                 cell.alignment = center_alignment
                 cell.border = thin_border
         
+        for col in worksheet.iter_cols(min_row=2, max_row=worksheet.max_row, max_col=worksheet.max_column):
+            for cell in col:
+                cell.alignment = center_alignment
+                cell.border = thin_border
+                
         for column_cells in worksheet.columns:
             length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
             worksheet.column_dimensions[column_cells[0].column_letter].width = length + 4
