@@ -41,9 +41,32 @@ def aplicar_estilo_blindado():
 
 aplicar_estilo_blindado()
 
-# --- 1. MOTOR DE DADOS ---
+# --- 1. MOTORES DE DADOS E INTELIGÊNCIA ---
 HISTORICO_PATH = "historico_seriais.parquet"
 ENDERECOS_PATH = "Endereços Transitorios.xlsx"
+
+@st.cache_data(ttl=60)
+def get_enderecos_vivo():
+    """Lê a planilha de regras de negócio (SLA) de forma inteligente à prova de erros de digitação."""
+    if not os.path.exists(ENDERECOS_PATH): return pd.DataFrame()
+    df_e = pd.read_excel(ENDERECOS_PATH)
+    df_e.rename(columns=lambda x: str(x).strip(), inplace=True)
+    
+    col_end, col_az, col_resp, col_rota = None, None, None, None
+    for c in df_e.columns:
+        if 'endere' in c.lower() or 'endereço' in c.lower(): col_end = c
+        elif c.lower() == 'az': col_az = c
+        elif 'respons' in c.lower(): col_resp = c
+        elif 'rota' in c.lower() or 'tempo' in c.lower() or 'dia' in c.lower(): col_rota = c
+
+    rename_dict = {}
+    if col_end: rename_dict[col_end] = 'ENDEREÇO_REF'
+    if col_az: rename_dict[col_az] = 'AZ_REF'
+    if col_resp: rename_dict[col_resp] = 'RESPONSAVEL_REF'
+    if col_rota: rename_dict[col_rota] = 'Limite_SLA_Dias'
+    
+    df_e.rename(columns=rename_dict, inplace=True)
+    return df_e
 
 @st.cache_data(ttl=60)
 def load_data():
@@ -55,7 +78,7 @@ def load_data():
         else:
             df['DT Ultimo Endereco'] = pd.to_datetime(df['DT Ultimo Endereco'], errors='coerce')
         if 'Dias End. Atual' not in df.columns:
-            df['Dias End. Atual'] = df.get('Dias Pendentes', 0)
+            df['Dias End. Atual'] = df['Dias Pendentes'] if 'Dias Pendentes' in df.columns else 0
         return df
     return pd.DataFrame()
 
@@ -76,26 +99,18 @@ def push_to_github():
 
 def processar_motor(arquivo_novo, data_selecionada):
     df_batimento = pd.read_excel(arquivo_novo, skiprows=6)
-    df_enderecos = pd.read_excel(ENDERECOS_PATH)
-    df_enderecos.rename(columns=lambda x: x.strip(), inplace=True)
+    df_enderecos_vivo = get_enderecos_vivo()
+    
+    if df_enderecos_vivo.empty:
+        st.error("Erro: A planilha Endereços Transitorios.xlsx não foi encontrada!")
+        return False
+        
     df_batimento.rename(columns={'Data doc': 'DT Doc', 'Data Serial': 'DT Serial'}, inplace=True)
     
-    df_atual = pd.merge(df_batimento, df_enderecos, left_on='Endereço', right_on='ENDEREÇO', how='inner')
-    
+    # Faz o filtro de segurança na porta
+    df_atual = pd.merge(df_batimento, df_enderecos_vivo, left_on='Endereço', right_on='ENDEREÇO_REF', how='inner')
     data_operacao = pd.to_datetime(data_selecionada)
     df_hist = load_data()
-
-    def calc_prioridade(row):
-        limite = row.get('Tempo de Rota(Dia)', 1)
-        dias_no_endereco = row.get('Dias End. Atual', 0)
-        if pd.isna(limite): limite = 1
-        
-        if dias_no_endereco > limite:
-            return 'ESTOURADO'
-        elif dias_no_endereco == limite or (limite - dias_no_endereco) <= 1:
-            return 'CRÍTICO'
-        else:
-            return 'Normal'
 
     if df_hist.empty:
         df_hist = df_atual.copy()
@@ -106,7 +121,6 @@ def processar_motor(arquivo_novo, data_selecionada):
         df_hist['Status'] = 'Em Trânsito'
         df_hist['Dias Pendentes'] = 0
         df_hist['Dias End. Atual'] = 0
-        df_hist['Prioridade'] = df_hist.apply(calc_prioridade, axis=1)
     else:
         df_hist_ativo = df_hist[df_hist['Status'] == 'Em Trânsito'].copy()
         ativos_lista = df_hist_ativo['Serial'].tolist()
@@ -132,7 +146,6 @@ def processar_motor(arquivo_novo, data_selecionada):
         df_mantidos['Status'] = 'Em Trânsito'
         df_mantidos['Dias Pendentes'] = (data_operacao - pd.to_datetime(df_mantidos['DT Entrada'])).dt.days
         df_mantidos['Dias End. Atual'] = (data_operacao - pd.to_datetime(df_mantidos['DT Ultimo Endereco'])).dt.days
-        df_mantidos['Prioridade'] = df_mantidos.apply(calc_prioridade, axis=1)
         df_mantidos = df_mantidos.drop(columns=['Endereço Antigo Memoria'])
         
         df_novos = df_atual[~df_atual['Serial'].isin(ativos_lista)].copy()
@@ -143,7 +156,6 @@ def processar_motor(arquivo_novo, data_selecionada):
         df_novos['Status'] = 'Em Trânsito'
         df_novos['Dias Pendentes'] = 0
         df_novos['Dias End. Atual'] = 0
-        df_novos['Prioridade'] = df_novos.apply(calc_prioridade, axis=1)
         
         df_saidas = df_hist_ativo[~df_hist_ativo['Serial'].isin(df_atual['Serial'].tolist())].copy()
         df_saidas['Status'] = 'Finalizado'
@@ -151,6 +163,10 @@ def processar_motor(arquivo_novo, data_selecionada):
         
         df_hist = pd.concat([df_hist[df_hist['Status'] == 'Finalizado'], df_saidas, df_mantidos, df_novos], ignore_index=True)
 
+    # Limpeza de colunas temporárias de SLA antes de salvar (mantém o banco leve)
+    cols_to_drop = [c for c in ['ENDEREÇO_REF', 'AZ_REF', 'RESPONSAVEL_REF', 'Limite_SLA_Dias'] if c in df_hist.columns]
+    df_hist.drop(columns=cols_to_drop, inplace=True, errors='ignore')
+    
     df_hist.to_parquet(HISTORICO_PATH, index=False)
     return push_to_github()
 
@@ -160,7 +176,6 @@ with st.sidebar:
     if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, use_container_width=True)
     
     st.markdown("### 🔄 Atualização de Dados")
-    
     df_full = load_data()
     ultima_data_banco = None
     
@@ -184,14 +199,41 @@ with st.sidebar:
         btn_label = "Sincronizar Retenção" if not data_ja_processada else "Sobrescrever Dados (Cuidado)"
         btn_type = "primary" if not data_ja_processada else "secondary"
         if st.button(btn_label, use_container_width=True, type=btn_type):
-            with st.spinner("Calculando SLAs..."):
+            with st.spinner("Mapeando histórico e atualizando SLAs..."):
                 if processar_motor(arquivo, data_batimento):
-                    st.success("Atualizado!")
+                    st.success("Sincronizado com Sucesso!")
                     st.rerun()
 
     st.markdown("---")
-    df_pendente = df_full[df_full['Status'] == 'Em Trânsito'] if not df_full.empty else pd.DataFrame()
     
+    df_pendente = df_full[df_full['Status'] == 'Em Trânsito'].copy() if not df_full.empty else pd.DataFrame()
+
+    # 🔥 MÁGICA: APLICAÇÃO DINÂMICA DO SLA EM TEMPO REAL 🔥
+    if not df_pendente.empty:
+        df_end_live = get_enderecos_vivo()
+        if not df_end_live.empty:
+            df_pendente = pd.merge(df_pendente, df_end_live, left_on='Endereço', right_on='ENDEREÇO_REF', how='left')
+            
+            # Sobrescreve AZ e RESPONSAVEL vivos do Excel
+            if 'AZ_REF' in df_pendente.columns: df_pendente['AZ'] = df_pendente['AZ_REF'].fillna(df_pendente.get('AZ', '-'))
+            if 'RESPONSAVEL_REF' in df_pendente.columns: df_pendente['RESPONSAVEL'] = df_pendente['RESPONSAVEL_REF'].fillna(df_pendente.get('RESPONSAVEL', '-'))
+            if 'Limite_SLA_Dias' not in df_pendente.columns: df_pendente['Limite_SLA_Dias'] = 1
+            
+            # Função implacável de Prioridade
+            def calc_pri_vivo(row):
+                lim = row.get('Limite_SLA_Dias', 1)
+                d = row.get('Dias End. Atual', 0)
+                try: lim = int(lim)
+                except: lim = 1
+                try: d = int(d)
+                except: d = 0
+                
+                if d > lim: return 'ESTOURADO'
+                elif d == lim or (lim - d) <= 1: return 'CRÍTICO'
+                else: return 'Normal'
+                
+            df_pendente['Prioridade'] = df_pendente.apply(calc_pri_vivo, axis=1)
+
     if not df_pendente.empty:
         st.markdown("### 🔍 Filtros")
         f_az = st.selectbox("Filtrar por AZ", ["Todos"] + sorted(df_pendente['AZ'].dropna().unique().tolist()))
@@ -200,14 +242,13 @@ with st.sidebar:
 # --- 3. DASHBOARD ---
 st.title("📦 Hub de Retenção Transitória")
 
-if df_full.empty:
-    st.info("A base está vazia.")
+if df_full.empty or df_pendente.empty:
+    st.info("A base está vazia ou não há seriais no transitório.")
     st.stop()
 
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.metric("Seriais no Transitório", len(df_pendente))
 
-# Se a base for velha e ainda não tiver a coluna, a gente previne o erro zerando visualmente
 qtd_estourados = len(df_pendente[df_pendente['Prioridade'] == 'ESTOURADO']) if 'Prioridade' in df_pendente.columns else 0
 qtd_criticos = len(df_pendente[df_pendente['Prioridade'] == 'CRÍTICO']) if 'Prioridade' in df_pendente.columns else 0
 
@@ -217,85 +258,83 @@ with c4: st.metric("🔄 Mov. Internas", len(df_pendente[df_pendente['Qtd Movime
 
 st.markdown("---")
 
-if not df_pendente.empty:
-    st.subheader("🔥 Foco de Atuação: SLAs Estourados")
-    
-    if 'Prioridade' in df_pendente.columns:
-        df_problema = df_pendente[df_pendente['Prioridade'] == 'ESTOURADO']
-        if not df_problema.empty:
-            grafico_problema = df_problema.groupby(['AZ', 'RESPONSAVEL']).size().reset_index(name='Qtd_Retida')
-            fig = px.bar(grafico_problema, x="AZ", y="Qtd_Retida", color="RESPONSAVEL", text_auto=True, template="plotly_white", color_discrete_sequence=px.colors.qualitative.Bold)
-            fig.update_layout(xaxis={'categoryorder':'total descending'}, legend_title_text="Dono da Área")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.success("🎉 Nenhum serial estourou o limite.")
+st.subheader("🔥 Foco de Atuação: SLAs Estourados")
+if 'Prioridade' in df_pendente.columns:
+    df_problema = df_pendente[df_pendente['Prioridade'] == 'ESTOURADO']
+    if not df_problema.empty:
+        grafico_problema = df_problema.groupby(['AZ', 'RESPONSAVEL']).size().reset_index(name='Qtd_Retida')
+        fig = px.bar(grafico_problema, x="AZ", y="Qtd_Retida", color="RESPONSAVEL", text_auto=True, template="plotly_white", color_discrete_sequence=px.colors.qualitative.Bold)
+        fig.update_layout(xaxis={'categoryorder':'total descending'}, legend_title_text="Dono da Área")
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Sincronize um novo batimento para ativar a contagem de SLA.")
+        st.success("🎉 Nenhum serial estourou o limite de seus respectivos endereços.")
 
-    st.markdown("---")
-    st.subheader("📋 Mapa de Rastreio Operacional")
-    
-    # 🛡️ TRAVA DE SEGURANÇA RESTAURADA: Só carrega as colunas que realmente existem no Parquet
-    colunas_visoes = ['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias End. Atual', 'Tempo de Rota(Dia)', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']
-    colunas_existentes = [col for col in colunas_visoes if col in df_pendente.columns]
-    
-    df_detalhe = df_pendente[colunas_existentes].copy()
-    
-    renomeacoes = {
-        'Endereço': 'Endereço Atual', 
-        'Endereço Anterior': 'End. Anterior', 
-        'Qtd Movimentações': 'Mov. Internas', 
-        'DT Entrada': 'DT Chegada (Inicial)',
-        'Tempo de Rota(Dia)': '(Dias Permitidos no Endereço)',
-        'Dias Pendentes': 'Dias Totais (Trânsito)'
-    }
-    
-    df_detalhe.rename(columns=renomeacoes, inplace=True)
-    
-    if 'DT Chegada (Inicial)' in df_detalhe.columns:
-        df_detalhe['DT Chegada (Inicial)'] = df_detalhe['DT Chegada (Inicial)'].dt.strftime('%d/%m/%Y')
-    
-    # Ordenação flexível (só usa a coluna se ela existir)
-    colunas_ordenacao = []
-    if 'Prioridade' in df_detalhe.columns: colunas_ordenacao.append('Prioridade')
-    if 'Dias End. Atual' in df_detalhe.columns: colunas_ordenacao.append('Dias End. Atual')
-    
-    if colunas_ordenacao:
-        df_detalhe = df_detalhe.sort_values(by=colunas_ordenacao, ascending=[True, False][:len(colunas_ordenacao)])
-    
-    st.dataframe(df_detalhe, use_container_width=True, hide_index=True)
+st.markdown("---")
+st.subheader("📋 Mapa de Rastreio Operacional")
 
-    # --- EXPORTAÇÃO EXCEL ---
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df_detalhe.to_excel(writer, index=False, sheet_name='Analise_Retencao')
-        workbook = writer.book
-        worksheet = writer.sheets['Analise_Retencao']
-        header_fill = PatternFill(start_color="003366", end_color="003366", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True)
-        center_alignment = Alignment(horizontal="center", vertical="center")
-        thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-        
-        for col in worksheet.iter_cols(min_row=1, max_row=1, max_col=worksheet.max_column):
-            for cell in col:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = center_alignment
-                cell.border = thin_border
-        
-        for col in worksheet.iter_cols(min_row=2, max_row=worksheet.max_row, max_col=worksheet.max_column):
-            for cell in col:
-                cell.alignment = center_alignment
-                cell.border = thin_border
-                
-        for column_cells in worksheet.columns:
-            length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
-            worksheet.column_dimensions[column_cells[0].column_letter].width = length + 4
+colunas_visoes = ['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias End. Atual', 'Limite_SLA_Dias', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']
+colunas_existentes = [col for col in colunas_visoes if col in df_pendente.columns]
 
-    st.download_button(
-        label="📥 Extrair Relatório em Excel",
-        data=buffer.getvalue(),
-        file_name=f"Analise_Giro_Tecadi_{datetime.now().strftime('%d%m%Y')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary"
-    )
+df_detalhe = df_pendente[colunas_existentes].copy()
+
+renomeacoes = {
+    'Endereço': 'Endereço Atual', 
+    'Endereço Anterior': 'End. Anterior', 
+    'Qtd Movimentações': 'Mov. Internas', 
+    'DT Entrada': 'DT Chegada (Inicial)',
+    'Limite_SLA_Dias': '(Dias Permitidos no Endereço)',
+    'Dias Pendentes': 'Dias Totais (Trânsito)'
+}
+
+df_detalhe.rename(columns=renomeacoes, inplace=True)
+
+if 'DT Chegada (Inicial)' in df_detalhe.columns:
+    df_detalhe['DT Chegada (Inicial)'] = df_detalhe['DT Chegada (Inicial)'].dt.strftime('%d/%m/%Y')
+
+colunas_ordenacao = []
+if 'Prioridade' in df_detalhe.columns: colunas_ordenacao.append('Prioridade')
+if 'Dias End. Atual' in df_detalhe.columns: colunas_ordenacao.append('Dias End. Atual')
+
+if colunas_ordenacao:
+    # Ajuste de peso para ordenar ESTOURADO > CRÍTICO > Normal
+    ordem_pri = {'ESTOURADO': 1, 'CRÍTICO': 2, 'Normal': 3}
+    if 'Prioridade' in df_detalhe.columns:
+        df_detalhe['Ordem_Temp'] = df_detalhe['Prioridade'].map(ordem_pri).fillna(4)
+        df_detalhe = df_detalhe.sort_values(by=['Ordem_Temp', 'Dias End. Atual'], ascending=[True, False]).drop(columns=['Ordem_Temp'])
+
+st.dataframe(df_detalhe, use_container_width=True, hide_index=True)
+
+# --- EXPORTAÇÃO EXCEL ---
+buffer = io.BytesIO()
+with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+    df_detalhe.to_excel(writer, index=False, sheet_name='Analise_Retencao')
+    workbook = writer.book
+    worksheet = writer.sheets['Analise_Retencao']
+    header_fill = PatternFill(start_color="003366", end_color="003366", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    center_alignment = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+    
+    for col in worksheet.iter_cols(min_row=1, max_row=1, max_col=worksheet.max_column):
+        for cell in col:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+            cell.border = thin_border
+            
+    for col in worksheet.iter_cols(min_row=2, max_row=worksheet.max_row, max_col=worksheet.max_column):
+        for cell in col:
+            cell.alignment = center_alignment
+            cell.border = thin_border
+            
+    for column_cells in worksheet.columns:
+        length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
+        worksheet.column_dimensions[column_cells[0].column_letter].width = length + 4
+
+st.download_button(
+    label="📥 Extrair Relatório em Excel",
+    data=buffer.getvalue(),
+    file_name=f"Analise_Giro_Tecadi_{datetime.now().strftime('%d%m%Y')}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    type="primary"
+)
