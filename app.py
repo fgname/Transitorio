@@ -47,7 +47,6 @@ ENDERECOS_PATH = "Endereços Transitorios.xlsx"
 
 @st.cache_data(ttl=60)
 def get_enderecos_vivo():
-    """Lê a planilha de regras de negócio (SLA) de forma inteligente à prova de erros de digitação."""
     if not os.path.exists(ENDERECOS_PATH): return pd.DataFrame()
     df_e = pd.read_excel(ENDERECOS_PATH)
     df_e.rename(columns=lambda x: str(x).strip(), inplace=True)
@@ -107,7 +106,6 @@ def processar_motor(arquivo_novo, data_selecionada):
         
     df_batimento.rename(columns={'Data doc': 'DT Doc', 'Data Serial': 'DT Serial'}, inplace=True)
     
-    # Faz o filtro de segurança na porta
     df_atual = pd.merge(df_batimento, df_enderecos_vivo, left_on='Endereço', right_on='ENDEREÇO_REF', how='inner')
     data_operacao = pd.to_datetime(data_selecionada)
     df_hist = load_data()
@@ -163,7 +161,6 @@ def processar_motor(arquivo_novo, data_selecionada):
         
         df_hist = pd.concat([df_hist[df_hist['Status'] == 'Finalizado'], df_saidas, df_mantidos, df_novos], ignore_index=True)
 
-    # Limpeza de colunas temporárias de SLA antes de salvar (mantém o banco leve)
     cols_to_drop = [c for c in ['ENDEREÇO_REF', 'AZ_REF', 'RESPONSAVEL_REF', 'Limite_SLA_Dias'] if c in df_hist.columns]
     df_hist.drop(columns=cols_to_drop, inplace=True, errors='ignore')
     
@@ -208,18 +205,15 @@ with st.sidebar:
     
     df_pendente = df_full[df_full['Status'] == 'Em Trânsito'].copy() if not df_full.empty else pd.DataFrame()
 
-    # 🔥 MÁGICA: APLICAÇÃO DINÂMICA DO SLA EM TEMPO REAL 🔥
     if not df_pendente.empty:
         df_end_live = get_enderecos_vivo()
         if not df_end_live.empty:
             df_pendente = pd.merge(df_pendente, df_end_live, left_on='Endereço', right_on='ENDEREÇO_REF', how='left')
             
-            # Sobrescreve AZ e RESPONSAVEL vivos do Excel
             if 'AZ_REF' in df_pendente.columns: df_pendente['AZ'] = df_pendente['AZ_REF'].fillna(df_pendente.get('AZ', '-'))
             if 'RESPONSAVEL_REF' in df_pendente.columns: df_pendente['RESPONSAVEL'] = df_pendente['RESPONSAVEL_REF'].fillna(df_pendente.get('RESPONSAVEL', '-'))
             if 'Limite_SLA_Dias' not in df_pendente.columns: df_pendente['Limite_SLA_Dias'] = 1
             
-            # Função implacável de Prioridade
             def calc_pri_vivo(row):
                 lim = row.get('Limite_SLA_Dias', 1)
                 d = row.get('Dias End. Atual', 0)
@@ -272,12 +266,14 @@ if 'Prioridade' in df_pendente.columns:
 st.markdown("---")
 st.subheader("📋 Mapa de Rastreio Operacional")
 
-colunas_visoes = ['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias End. Atual', 'Limite_SLA_Dias', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']
+# 🔥 AQUI ESTÁ A MÁGICA: Adicionei 'Produto' na visão do painel e do Excel 🔥
+colunas_visoes = ['Produto', 'Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias End. Atual', 'Limite_SLA_Dias', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']
 colunas_existentes = [col for col in colunas_visoes if col in df_pendente.columns]
 
 df_detalhe = df_pendente[colunas_existentes].copy()
 
 renomeacoes = {
+    'Produto': 'Código do Produto',
     'Endereço': 'Endereço Atual', 
     'Endereço Anterior': 'End. Anterior', 
     'Qtd Movimentações': 'Mov. Internas', 
@@ -296,7 +292,6 @@ if 'Prioridade' in df_detalhe.columns: colunas_ordenacao.append('Prioridade')
 if 'Dias End. Atual' in df_detalhe.columns: colunas_ordenacao.append('Dias End. Atual')
 
 if colunas_ordenacao:
-    # Ajuste de peso para ordenar ESTOURADO > CRÍTICO > Normal
     ordem_pri = {'ESTOURADO': 1, 'CRÍTICO': 2, 'Normal': 3}
     if 'Prioridade' in df_detalhe.columns:
         df_detalhe['Ordem_Temp'] = df_detalhe['Prioridade'].map(ordem_pri).fillna(4)
