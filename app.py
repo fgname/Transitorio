@@ -50,11 +50,14 @@ def load_data():
         df = pd.read_parquet(HISTORICO_PATH)
         df['DT Entrada'] = pd.to_datetime(df['DT Entrada'], errors='coerce')
         
-        # AUTOCURA: Se a coluna de controle do último endereço não existir na base antiga, ele cria.
+        # AUTOCURA: Cria colunas faltantes se a base for antiga
         if 'DT Ultimo Endereco' not in df.columns:
             df['DT Ultimo Endereco'] = df['DT Entrada']
         else:
             df['DT Ultimo Endereco'] = pd.to_datetime(df['DT Ultimo Endereco'], errors='coerce')
+            
+        if 'Dias End. Atual' not in df.columns:
+            df['Dias End. Atual'] = df['Dias Pendentes']
             
         return df
     return pd.DataFrame()
@@ -77,19 +80,33 @@ def push_to_github():
 def processar_motor(arquivo_novo, data_selecionada):
     df_batimento = pd.read_excel(arquivo_novo, skiprows=6)
     df_enderecos = pd.read_excel(ENDERECOS_PATH)
+    
+    # Limpeza por segurança: remove espaços ocultos nos nomes das colunas
+    df_enderecos.rename(columns=lambda x: x.strip(), inplace=True)
     df_batimento.rename(columns={'Data doc': 'DT Doc', 'Data Serial': 'DT Serial'}, inplace=True)
     
     df_atual = pd.merge(df_batimento, df_enderecos, left_on='Endereço', right_on='ENDEREÇO', how='inner')
     
-    def set_prioridade(row):
-        criticos = ['B110', 'B116']
-        for col in ['Tp.Estoque Midea', 'Subestoque Midea', 'Tp.Estoque Tecadi', 'Subestoque Tecadi']:
-            if row.get(col) in criticos: return 'CRÍTICO'
-        return 'Normal'
-    
-    df_atual['Prioridade'] = df_atual.apply(set_prioridade, axis=1)
     data_operacao = pd.to_datetime(data_selecionada)
     df_hist = load_data()
+
+    # --- REGRA DE SLA DINÂMICO ---
+    def calc_prioridade(row):
+        # Tenta pegar o Tempo de Rota(Dia). Se por algum erro a coluna sumir, assume limite de 1 dia.
+        limite = row.get('Tempo de Rota(Dia)', 1)
+        dias_no_endereco = row.get('Dias End. Atual', 0)
+        
+        if pd.isna(limite): 
+            limite = 1
+            
+        dias_restantes = limite - dias_no_endereco
+        
+        if dias_restantes < 0:
+            return 'ESTOURADO'
+        elif dias_restantes <= 1:
+            return 'CRÍTICO'
+        else:
+            return 'Normal'
 
     if df_hist.empty:
         df_hist = df_atual.copy()
@@ -100,11 +117,14 @@ def processar_motor(arquivo_novo, data_selecionada):
         df_hist['Status'] = 'Em Trânsito'
         df_hist['Dias Pendentes'] = 0
         df_hist['Dias End. Atual'] = 0
+        df_hist['Prioridade'] = df_hist.apply(calc_prioridade, axis=1)
     else:
         df_hist_ativo = df_hist[df_hist['Status'] == 'Em Trânsito'].copy()
         ativos_lista = df_hist_ativo['Serial'].tolist()
         
+        # 1. SERIAIS QUE CONTINUAM NO TRÂNSITO
         df_mantidos = df_atual[df_atual['Serial'].isin(ativos_lista)].copy()
+        
         old_end = df_hist_ativo.set_index('Serial')['Endereço']
         old_mov = df_hist_ativo.set_index('Serial')['Qtd Movimentações']
         old_dt = df_hist_ativo.set_index('Serial')['DT Entrada']
@@ -117,10 +137,9 @@ def processar_motor(arquivo_novo, data_selecionada):
         
         mudou_mask = df_mantidos['Endereço'] != df_mantidos['Endereço Antigo Memoria']
         
-        # Lógica de atualização quando o serial muda de endereço transitório
         df_mantidos['Endereço Anterior'] = df_mantidos['Serial'].map(old_ant)
         df_mantidos.loc[mudou_mask, 'Endereço Anterior'] = df_mantidos.loc[mudou_mask, 'Endereço Antigo Memoria']
-        df_mantidos.loc[mudou_mask, 'DT Ultimo Endereco'] = data_operacao # Reseta o relógio do endereço atual
+        df_mantidos.loc[mudou_mask, 'DT Ultimo Endereco'] = data_operacao 
         
         df_mantidos['Qtd Movimentações'] = df_mantidos['Serial'].map(old_mov).fillna(0)
         df_mantidos.loc[mudou_mask, 'Qtd Movimentações'] += 1
@@ -129,8 +148,11 @@ def processar_motor(arquivo_novo, data_selecionada):
         df_mantidos['Dias Pendentes'] = (data_operacao - pd.to_datetime(df_mantidos['DT Entrada'])).dt.days
         df_mantidos['Dias End. Atual'] = (data_operacao - pd.to_datetime(df_mantidos['DT Ultimo Endereco'])).dt.days
         
+        # Aplica a regra de SLA usando o Limite de Rota do Endereço Atual
+        df_mantidos['Prioridade'] = df_mantidos.apply(calc_prioridade, axis=1)
         df_mantidos = df_mantidos.drop(columns=['Endereço Antigo Memoria'])
         
+        # 2. NOVOS SERIAIS
         df_novos = df_atual[~df_atual['Serial'].isin(ativos_lista)].copy()
         df_novos['DT Entrada'] = data_operacao
         df_novos['DT Ultimo Endereco'] = data_operacao
@@ -139,7 +161,9 @@ def processar_motor(arquivo_novo, data_selecionada):
         df_novos['Status'] = 'Em Trânsito'
         df_novos['Dias Pendentes'] = 0
         df_novos['Dias End. Atual'] = 0
+        df_novos['Prioridade'] = df_novos.apply(calc_prioridade, axis=1)
         
+        # 3. SAÍDAS
         df_saidas = df_hist_ativo[~df_hist_ativo['Serial'].isin(df_atual['Serial'].tolist())].copy()
         df_saidas['Status'] = 'Finalizado'
         df_saidas['DT Saída'] = data_operacao
@@ -162,7 +186,7 @@ with st.sidebar:
     if not df_full.empty:
         df_pendente_temp = df_full[df_full['Status'] == 'Em Trânsito']
         if not df_pendente_temp.empty:
-            ultima_data_banco = (df_pendente_temp['DT Entrada'] + pd.to_timedelta(df_pendente_temp['Dias Pendentes'], unit='d')).max()
+            ultima_data_banco = (df_pendente_temp['DT Entrada'] + pd.to_timedelta(df_pendente_temp['Dias Pendentes'], unit='D')).max()
         else:
             ultima_data_banco = pd.to_datetime(df_full['DT Saída'], errors='coerce').max()
             
@@ -181,7 +205,7 @@ with st.sidebar:
         btn_type = "primary" if not data_ja_processada else "secondary"
         
         if st.button(btn_label, use_container_width=True, type=btn_type):
-            with st.spinner("Mapeando histórico..."):
+            with st.spinner("Mapeando histórico e calculando SLAs..."):
                 if processar_motor(arquivo, data_batimento):
                     st.success(f"Base de {data_batimento.strftime('%d/%m/%Y')} atualizada!")
                     st.rerun()
@@ -201,17 +225,27 @@ if df_full.empty:
     st.info("A base está vazia. Informe a data e anexe o primeiro batimento.")
     st.stop()
 
+# --- KPIs GERAIS ---
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.metric("Seriais no Transitório", len(df_pendente))
-with c2: st.metric("Estouro Grave (1+ Dias)", len(df_pendente[df_pendente['Dias Pendentes'] >= 1]))
-with c3: st.metric("Movimentados Internamente", len(df_pendente[df_pendente['Qtd Movimentações'] > 0]))
-with c4: st.metric("⚠️ Críticos (B110/B116)", len(df_pendente[df_pendente['Prioridade'] == 'CRÍTICO']))
+
+# Agora os KPIs refletem a regra dinâmica de cada endereço
+qtd_estourados = len(df_pendente[df_pendente['Prioridade'] == 'ESTOURADO'])
+qtd_criticos = len(df_pendente[df_pendente['Prioridade'] == 'CRÍTICO'])
+
+with c2: st.metric("🚨 SLA Estourado", qtd_estourados)
+with c3: st.metric("⚠️ Risco Crítico (1 Dia pro SLA)", qtd_criticos)
+with c4: st.metric("🔄 Movimentados Internamente", len(df_pendente[df_pendente['Qtd Movimentações'] > 0]))
 
 st.markdown("---")
 
 if not df_pendente.empty:
-    st.subheader("🔥 Foco de Atuação: Seriais Retidos há 1 Dia ou Mais")
-    df_problema = df_pendente[df_pendente['Dias Pendentes'] >= 1]
+    # --- GRÁFICO DO PROBLEMA ---
+    st.subheader("🔥 Foco de Atuação: SLAs Estourados")
+    st.markdown("Este gráfico mostra os seriais que **já ultrapassaram o tempo limite específico** do seu endereço atual.")
+    
+    # Filtra apenas quem está ESTOURADO
+    df_problema = df_pendente[df_pendente['Prioridade'] == 'ESTOURADO']
     
     if not df_problema.empty:
         grafico_problema = df_problema.groupby(['AZ', 'RESPONSAVEL']).size().reset_index(name='Qtd_Retida')
@@ -220,26 +254,33 @@ if not df_pendente.empty:
             text_auto=True, template="plotly_white",
             color_discrete_sequence=px.colors.qualitative.Bold
         )
-        fig.update_layout(xaxis={'categoryorder':'total descending'})
+        fig.update_layout(xaxis={'categoryorder':'total descending'}, legend_title_text="Dono da Área")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.success("🎉 Excelente! Nada retido por mais de 1 dia.")
+        st.success("🎉 Operação limpa! Nenhum serial estourou o limite de permanência de seus respectivos endereços.")
 
     st.markdown("---")
     st.subheader("📋 Mapa de Rastreio Operacional")
     
-    # Adicionando a nova métrica na visão de detalhe
-    df_detalhe = df_pendente[['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias Pendentes', 'Dias End. Atual', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']].copy()
+    # Adicionando a coluna Tempo de Rota para dar contexto visual à equipe
+    colunas_visoes = ['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Tempo de Rota(Dia)', 'Dias End. Atual', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']
     
-    # Renomeando as colunas, otimizando o espaço conforme o seu padrão
-    df_detalhe.rename(columns={
+    # Garantia contra quebra caso o Excel novo não tenha subido corretamente ainda
+    colunas_existentes = [col for col in colunas_visoes if col in df_pendente.columns]
+    df_detalhe = df_pendente[colunas_existentes].copy()
+    
+    renomeacoes = {
         'Endereço': 'Endereço Atual', 
         'Endereço Anterior': 'End. Anterior', 
         'Qtd Movimentações': 'Mov. Internas', 
-        'DT Entrada': 'DT Chegada'
-    }, inplace=True)
+        'DT Entrada': 'DT Chegada',
+        'Tempo de Rota(Dia)': 'Limite (Dias)'
+    }
     
-    df_detalhe['DT Chegada'] = df_detalhe['DT Chegada'].dt.strftime('%d/%m/%Y')
+    df_detalhe.rename(columns={k: v for k, v in renomeacoes.items() if k in df_detalhe.columns}, inplace=True)
     
-    # Tabela agora exibe a coluna "Dias End. Atual" logo do lado do total de dias
-    st.dataframe(df_detalhe.sort_values(by=["Dias Pendentes", "Mov. Internas"], ascending=False), use_container_width=True, hide_index=True)
+    if 'DT Chegada' in df_detalhe.columns:
+        df_detalhe['DT Chegada'] = df_detalhe['DT Chegada'].dt.strftime('%d/%m/%Y')
+    
+    # Ordena pelos estourados e críticos no topo
+    st.dataframe(df_detalhe.sort_values(by=["Prioridade", "Mov. Internas"], ascending=[True, False]), use_container_width=True, hide_index=True)
