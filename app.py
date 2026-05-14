@@ -6,6 +6,7 @@ import base64
 import io
 from datetime import datetime, timedelta
 from github import Github
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
 # --- 0. CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Inteligência de Giro - Tecadi", layout="wide", initial_sidebar_state="expanded")
@@ -49,16 +50,12 @@ def load_data():
     if os.path.exists(HISTORICO_PATH):
         df = pd.read_parquet(HISTORICO_PATH)
         df['DT Entrada'] = pd.to_datetime(df['DT Entrada'], errors='coerce')
-        
-        # AUTOCURA: Cria colunas faltantes se a base for antiga
         if 'DT Ultimo Endereco' not in df.columns:
             df['DT Ultimo Endereco'] = df['DT Entrada']
         else:
             df['DT Ultimo Endereco'] = pd.to_datetime(df['DT Ultimo Endereco'], errors='coerce')
-            
         if 'Dias End. Atual' not in df.columns:
             df['Dias End. Atual'] = df['Dias Pendentes']
-            
         return df
     return pd.DataFrame()
 
@@ -80,8 +77,6 @@ def push_to_github():
 def processar_motor(arquivo_novo, data_selecionada):
     df_batimento = pd.read_excel(arquivo_novo, skiprows=6)
     df_enderecos = pd.read_excel(ENDERECOS_PATH)
-    
-    # Limpeza por segurança: remove espaços ocultos nos nomes das colunas
     df_enderecos.rename(columns=lambda x: x.strip(), inplace=True)
     df_batimento.rename(columns={'Data doc': 'DT Doc', 'Data Serial': 'DT Serial'}, inplace=True)
     
@@ -90,23 +85,14 @@ def processar_motor(arquivo_novo, data_selecionada):
     data_operacao = pd.to_datetime(data_selecionada)
     df_hist = load_data()
 
-    # --- REGRA DE SLA DINÂMICO ---
     def calc_prioridade(row):
-        # Tenta pegar o Tempo de Rota(Dia). Se por algum erro a coluna sumir, assume limite de 1 dia.
         limite = row.get('Tempo de Rota(Dia)', 1)
         dias_no_endereco = row.get('Dias End. Atual', 0)
-        
-        if pd.isna(limite): 
-            limite = 1
-            
+        if pd.isna(limite): limite = 1
         dias_restantes = limite - dias_no_endereco
-        
-        if dias_restantes < 0:
-            return 'ESTOURADO'
-        elif dias_restantes <= 1:
-            return 'CRÍTICO'
-        else:
-            return 'Normal'
+        if dias_restantes < 0: return 'ESTOURADO'
+        elif dias_restantes <= 1: return 'CRÍTICO'
+        else: return 'Normal'
 
     if df_hist.empty:
         df_hist = df_atual.copy()
@@ -122,9 +108,7 @@ def processar_motor(arquivo_novo, data_selecionada):
         df_hist_ativo = df_hist[df_hist['Status'] == 'Em Trânsito'].copy()
         ativos_lista = df_hist_ativo['Serial'].tolist()
         
-        # 1. SERIAIS QUE CONTINUAM NO TRÂNSITO
         df_mantidos = df_atual[df_atual['Serial'].isin(ativos_lista)].copy()
-        
         old_end = df_hist_ativo.set_index('Serial')['Endereço']
         old_mov = df_hist_ativo.set_index('Serial')['Qtd Movimentações']
         old_dt = df_hist_ativo.set_index('Serial')['DT Entrada']
@@ -136,23 +120,18 @@ def processar_motor(arquivo_novo, data_selecionada):
         df_mantidos['DT Ultimo Endereco'] = df_mantidos['Serial'].map(old_dt_ult)
         
         mudou_mask = df_mantidos['Endereço'] != df_mantidos['Endereço Antigo Memoria']
-        
         df_mantidos['Endereço Anterior'] = df_mantidos['Serial'].map(old_ant)
         df_mantidos.loc[mudou_mask, 'Endereço Anterior'] = df_mantidos.loc[mudou_mask, 'Endereço Antigo Memoria']
         df_mantidos.loc[mudou_mask, 'DT Ultimo Endereco'] = data_operacao 
-        
         df_mantidos['Qtd Movimentações'] = df_mantidos['Serial'].map(old_mov).fillna(0)
         df_mantidos.loc[mudou_mask, 'Qtd Movimentações'] += 1
         
         df_mantidos['Status'] = 'Em Trânsito'
         df_mantidos['Dias Pendentes'] = (data_operacao - pd.to_datetime(df_mantidos['DT Entrada'])).dt.days
         df_mantidos['Dias End. Atual'] = (data_operacao - pd.to_datetime(df_mantidos['DT Ultimo Endereco'])).dt.days
-        
-        # Aplica a regra de SLA usando o Limite de Rota do Endereço Atual
         df_mantidos['Prioridade'] = df_mantidos.apply(calc_prioridade, axis=1)
         df_mantidos = df_mantidos.drop(columns=['Endereço Antigo Memoria'])
         
-        # 2. NOVOS SERIAIS
         df_novos = df_atual[~df_atual['Serial'].isin(ativos_lista)].copy()
         df_novos['DT Entrada'] = data_operacao
         df_novos['DT Ultimo Endereco'] = data_operacao
@@ -163,7 +142,6 @@ def processar_motor(arquivo_novo, data_selecionada):
         df_novos['Dias End. Atual'] = 0
         df_novos['Prioridade'] = df_novos.apply(calc_prioridade, axis=1)
         
-        # 3. SAÍDAS
         df_saidas = df_hist_ativo[~df_hist_ativo['Serial'].isin(df_atual['Serial'].tolist())].copy()
         df_saidas['Status'] = 'Finalizado'
         df_saidas['DT Saída'] = data_operacao
@@ -189,7 +167,6 @@ with st.sidebar:
             ultima_data_banco = (df_pendente_temp['DT Entrada'] + pd.to_timedelta(df_pendente_temp['Dias Pendentes'], unit='D')).max()
         else:
             ultima_data_banco = pd.to_datetime(df_full['DT Saída'], errors='coerce').max()
-            
         st.warning(f"📌 **Última base lida: {ultima_data_banco.strftime('%d/%m/%Y')}**")
 
     data_batimento = st.date_input("Data do Novo Relatório:", value=datetime.today(), format="DD/MM/YYYY")
@@ -203,7 +180,6 @@ with st.sidebar:
     if arquivo:
         btn_label = "Sincronizar Retenção" if not data_ja_processada else "Sobrescrever Dados (Cuidado)"
         btn_type = "primary" if not data_ja_processada else "secondary"
-        
         if st.button(btn_label, use_container_width=True, type=btn_type):
             with st.spinner("Mapeando histórico e calculando SLAs..."):
                 if processar_motor(arquivo, data_batimento):
@@ -225,14 +201,10 @@ if df_full.empty:
     st.info("A base está vazia. Informe a data e anexe o primeiro batimento.")
     st.stop()
 
-# --- KPIs GERAIS ---
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.metric("Seriais no Transitório", len(df_pendente))
-
-# Agora os KPIs refletem a regra dinâmica de cada endereço
 qtd_estourados = len(df_pendente[df_pendente['Prioridade'] == 'ESTOURADO'])
 qtd_criticos = len(df_pendente[df_pendente['Prioridade'] == 'CRÍTICO'])
-
 with c2: st.metric("🚨 SLA Estourado", qtd_estourados)
 with c3: st.metric("⚠️ Risco Crítico (1 Dia pro SLA)", qtd_criticos)
 with c4: st.metric("🔄 Movimentados Internamente", len(df_pendente[df_pendente['Qtd Movimentações'] > 0]))
@@ -240,11 +212,7 @@ with c4: st.metric("🔄 Movimentados Internamente", len(df_pendente[df_pendente
 st.markdown("---")
 
 if not df_pendente.empty:
-    # --- GRÁFICO DO PROBLEMA ---
     st.subheader("🔥 Foco de Atuação: SLAs Estourados")
-    st.markdown("Este gráfico mostra os seriais que **já ultrapassaram o tempo limite específico** do seu endereço atual.")
-    
-    # Filtra apenas quem está ESTOURADO
     df_problema = df_pendente[df_pendente['Prioridade'] == 'ESTOURADO']
     
     if not df_problema.empty:
@@ -257,15 +225,12 @@ if not df_pendente.empty:
         fig.update_layout(xaxis={'categoryorder':'total descending'}, legend_title_text="Dono da Área")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.success("🎉 Operação limpa! Nenhum serial estourou o limite de permanência de seus respectivos endereços.")
+        st.success("🎉 Operação limpa! Nenhum serial estourou o limite.")
 
     st.markdown("---")
     st.subheader("📋 Mapa de Rastreio Operacional")
     
-    # Adicionando a coluna Tempo de Rota para dar contexto visual à equipe
-    colunas_visoes = ['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Tempo de Rota(Dia)', 'Dias End. Atual', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']
-    
-    # Garantia contra quebra caso o Excel novo não tenha subido corretamente ainda
+    colunas_visoes = ['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias End. Atual', 'Tempo de Rota(Dia)', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']
     colunas_existentes = [col for col in colunas_visoes if col in df_pendente.columns]
     df_detalhe = df_pendente[colunas_existentes].copy()
     
@@ -273,14 +238,56 @@ if not df_pendente.empty:
         'Endereço': 'Endereço Atual', 
         'Endereço Anterior': 'End. Anterior', 
         'Qtd Movimentações': 'Mov. Internas', 
-        'DT Entrada': 'DT Chegada',
-        'Tempo de Rota(Dia)': 'Limite (Dias)'
+        'DT Entrada': 'DT Chegada (Inicial)',
+        'Tempo de Rota(Dia)': 'Dias Permitidos',
+        'Dias Pendentes': 'Dias Totais (Trânsito)'
     }
-    
     df_detalhe.rename(columns={k: v for k, v in renomeacoes.items() if k in df_detalhe.columns}, inplace=True)
+    if 'DT Chegada (Inicial)' in df_detalhe.columns:
+        df_detalhe['DT Chegada (Inicial)'] = df_detalhe['DT Chegada (Inicial)'].dt.strftime('%d/%m/%Y')
     
-    if 'DT Chegada' in df_detalhe.columns:
-        df_detalhe['DT Chegada'] = df_detalhe['DT Chegada'].dt.strftime('%d/%m/%Y')
+    # Ordenação focada em resolver primeiro quem está estourado e com mais movimentações
+    df_detalhe = df_detalhe.sort_values(by=["Prioridade", "Mov. Internas"], ascending=[True, False])
     
-    # Ordena pelos estourados e críticos no topo
-    st.dataframe(df_detalhe.sort_values(by=["Prioridade", "Mov. Internas"], ascending=[True, False]), use_container_width=True, hide_index=True)
+    st.dataframe(df_detalhe, use_container_width=True, hide_index=True)
+
+    # --- EXPORTAÇÃO EXCEL FORMATADO ---
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df_detalhe.to_excel(writer, index=False, sheet_name='Analise_Retencao')
+        
+        workbook = writer.book
+        worksheet = writer.sheets['Analise_Retencao']
+        
+        # Estilos do Excel
+        header_fill = PatternFill(start_color="003366", end_color="003366", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        center_alignment = Alignment(horizontal="center", vertical="center")
+        thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+        
+        # Pintar o cabeçalho
+        for col in worksheet.iter_cols(min_row=1, max_row=1, max_col=worksheet.max_column):
+            for cell in col:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = center_alignment
+                cell.border = thin_border
+                
+        # Centralizar dados e colocar bordas
+        for col in worksheet.iter_cols(min_row=2, max_row=worksheet.max_row, max_col=worksheet.max_column):
+            for cell in col:
+                cell.alignment = center_alignment
+                cell.border = thin_border
+                
+        # Auto-ajuste da largura das colunas
+        for column_cells in worksheet.columns:
+            length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
+            worksheet.column_dimensions[column_cells[0].column_letter].width = length + 4
+
+    st.download_button(
+        label="📥 Extrair Relatório Formatado (Excel)",
+        data=buffer.getvalue(),
+        file_name=f"Mapa_Retencao_Tecadi_{datetime.now().strftime('%d%m%Y')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary"
+    )
