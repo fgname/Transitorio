@@ -54,8 +54,6 @@ def load_data():
             df['DT Ultimo Endereco'] = df['DT Entrada']
         else:
             df['DT Ultimo Endereco'] = pd.to_datetime(df['DT Ultimo Endereco'], errors='coerce')
-        if 'Dias End. Atual' not in df.columns:
-            df['Dias End. Atual'] = df['Dias Pendentes']
         return df
     return pd.DataFrame()
 
@@ -89,10 +87,13 @@ def processar_motor(arquivo_novo, data_selecionada):
         limite = row.get('Tempo de Rota(Dia)', 1)
         dias_no_endereco = row.get('Dias End. Atual', 0)
         if pd.isna(limite): limite = 1
-        dias_restantes = limite - dias_no_endereco
-        if dias_restantes < 0: return 'ESTOURADO'
-        elif dias_restantes <= 1: return 'CRÍTICO'
-        else: return 'Normal'
+        
+        if dias_no_endereco > limite:
+            return 'ESTOURADO'
+        elif dias_no_endereco == limite or (limite - dias_no_endereco) <= 1:
+            return 'CRÍTICO'
+        else:
+            return 'Normal'
 
     if df_hist.empty:
         df_hist = df_atual.copy()
@@ -181,9 +182,9 @@ with st.sidebar:
         btn_label = "Sincronizar Retenção" if not data_ja_processada else "Sobrescrever Dados (Cuidado)"
         btn_type = "primary" if not data_ja_processada else "secondary"
         if st.button(btn_label, use_container_width=True, type=btn_type):
-            with st.spinner("Mapeando histórico e calculando SLAs..."):
+            with st.spinner("Calculando SLAs..."):
                 if processar_motor(arquivo, data_batimento):
-                    st.success(f"Base de {data_batimento.strftime('%d/%m/%Y')} atualizada!")
+                    st.success("Atualizado!")
                     st.rerun()
 
     st.markdown("---")
@@ -198,7 +199,7 @@ with st.sidebar:
 st.title("📦 Hub de Retenção Transitória")
 
 if df_full.empty:
-    st.info("A base está vazia. Informe a data e anexe o primeiro batimento.")
+    st.info("A base está vazia.")
     st.stop()
 
 c1, c2, c3, c4 = st.columns(4)
@@ -206,8 +207,8 @@ with c1: st.metric("Seriais no Transitório", len(df_pendente))
 qtd_estourados = len(df_pendente[df_pendente['Prioridade'] == 'ESTOURADO'])
 qtd_criticos = len(df_pendente[df_pendente['Prioridade'] == 'CRÍTICO'])
 with c2: st.metric("🚨 SLA Estourado", qtd_estourados)
-with c3: st.metric("⚠️ Risco Crítico (1 Dia pro SLA)", qtd_criticos)
-with c4: st.metric("🔄 Movimentados Internamente", len(df_pendente[df_pendente['Qtd Movimentações'] > 0]))
+with c3: st.metric("⚠️ Risco Crítico", qtd_criticos)
+with c4: st.metric("🔄 Mov. Internas", len(df_pendente[df_pendente['Qtd Movimentações'] > 0]))
 
 st.markdown("---")
 
@@ -217,77 +218,59 @@ if not df_pendente.empty:
     
     if not df_problema.empty:
         grafico_problema = df_problema.groupby(['AZ', 'RESPONSAVEL']).size().reset_index(name='Qtd_Retida')
-        fig = px.bar(
-            grafico_problema, x="AZ", y="Qtd_Retida", color="RESPONSAVEL",
-            text_auto=True, template="plotly_white",
-            color_discrete_sequence=px.colors.qualitative.Bold
-        )
-        fig.update_layout(xaxis={'categoryorder':'total descending'}, legend_title_text="Dono da Área")
+        fig = px.bar(grafico_problema, x="AZ", y="Qtd_Retida", color="RESPONSAVEL", text_auto=True, template="plotly_white")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.success("🎉 Operação limpa! Nenhum serial estourou o limite.")
+        st.success("🎉 Nenhum serial estourou o limite.")
 
     st.markdown("---")
     st.subheader("📋 Mapa de Rastreio Operacional")
     
+    # Ordem das colunas ajustada para comparação direta
     colunas_visoes = ['Serial', 'AZ', 'RESPONSAVEL', 'Prioridade', 'Dias End. Atual', 'Tempo de Rota(Dia)', 'Dias Pendentes', 'Qtd Movimentações', 'Endereço', 'Endereço Anterior', 'DT Entrada']
-    colunas_existentes = [col for col in colunas_visoes if col in df_pendente.columns]
-    df_detalhe = df_pendente[colunas_existentes].copy()
+    df_detalhe = df_pendente[colunas_visoes].copy()
     
     renomeacoes = {
         'Endereço': 'Endereço Atual', 
         'Endereço Anterior': 'End. Anterior', 
         'Qtd Movimentações': 'Mov. Internas', 
         'DT Entrada': 'DT Chegada (Inicial)',
-        'Tempo de Rota(Dia)': 'Dias Permitidos',
+        'Tempo de Rota(Dia)': '(Dias Permitidos no Endereço)',
         'Dias Pendentes': 'Dias Totais (Trânsito)'
     }
-    df_detalhe.rename(columns={k: v for k, v in renomeacoes.items() if k in df_detalhe.columns}, inplace=True)
+    df_detalhe.rename(columns=renomeacoes, inplace=True)
     if 'DT Chegada (Inicial)' in df_detalhe.columns:
         df_detalhe['DT Chegada (Inicial)'] = df_detalhe['DT Chegada (Inicial)'].dt.strftime('%d/%m/%Y')
     
-    # Ordenação focada em resolver primeiro quem está estourado e com mais movimentações
-    df_detalhe = df_detalhe.sort_values(by=["Prioridade", "Mov. Internas"], ascending=[True, False])
-    
-    st.dataframe(df_detalhe, use_container_width=True, hide_index=True)
+    # Ordenar por estouro para os piores casos subirem
+    st.dataframe(df_detalhe.sort_values(by=["Prioridade", "Dias End. Atual"], ascending=[True, False]), use_container_width=True, hide_index=True)
 
-    # --- EXPORTAÇÃO EXCEL FORMATADO ---
+    # --- EXPORTAÇÃO EXCEL ---
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         df_detalhe.to_excel(writer, index=False, sheet_name='Analise_Retencao')
-        
         workbook = writer.book
         worksheet = writer.sheets['Analise_Retencao']
-        
-        # Estilos do Excel
         header_fill = PatternFill(start_color="003366", end_color="003366", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
         center_alignment = Alignment(horizontal="center", vertical="center")
         thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
         
-        # Pintar o cabeçalho
         for col in worksheet.iter_cols(min_row=1, max_row=1, max_col=worksheet.max_column):
             for cell in col:
                 cell.fill = header_fill
                 cell.font = header_font
                 cell.alignment = center_alignment
                 cell.border = thin_border
-                
-        # Centralizar dados e colocar bordas
-        for col in worksheet.iter_cols(min_row=2, max_row=worksheet.max_row, max_col=worksheet.max_column):
-            for cell in col:
-                cell.alignment = center_alignment
-                cell.border = thin_border
-                
-        # Auto-ajuste da largura das colunas
+        
         for column_cells in worksheet.columns:
             length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
             worksheet.column_dimensions[column_cells[0].column_letter].width = length + 4
 
     st.download_button(
-        label="📥 Extrair Relatório Formatado (Excel)",
+        label="📥 Extrair Relatório em Excel",
         data=buffer.getvalue(),
-        file_name=f"Mapa_Retencao_Tecadi_{datetime.now().strftime('%d%m%Y')}.xlsx",
+        file_name=f"Analise_Giro_Tecadi_{datetime.now().strftime('%d%m%Y')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary"
     )
